@@ -1,0 +1,633 @@
+-- ═══════════════════════════════════════════════════════════════
+-- SCHEMA SUPABASE — PLATEFORME COOPÉRATIVE MIXTE
+-- Coller dans : Supabase > SQL Editor > New Query > Run
+-- ═══════════════════════════════════════════════════════════════
+
+-- ── Extensions ────────────────────────────────────────────────
+create extension if not exists "uuid-ossp";
+
+-- ══════════════════════════════════════════════
+-- A. NOYAU : UTILISATEURS & MEMBRES
+-- ══════════════════════════════════════════════
+
+-- Table des utilisateurs (synchronisée avec auth.users)
+create table if not exists public.app_users (
+  id          uuid primary key references auth.users(id) on delete cascade,
+  email       text not null,
+  nom         text,
+  prenom      text,
+  telephone   text,
+  role        text not null default 'membre'
+                check (role in ('admin','secretaire','caissier','conseiller','membre')),
+  statut      text not null default 'actif'
+                check (statut in ('actif','suspendu','inactif')),
+  created_at  timestamptz default now()
+);
+
+-- Table des membres / adhérents
+create table if not exists public.membres (
+  id              uuid primary key default uuid_generate_v4(),
+  user_id         uuid references public.app_users(id) on delete set null,
+  numero_membre   text unique,
+  nom             text not null,
+  prenom          text not null,
+  nin             text,           -- Numéro d'identification nationale
+  telephone       text,
+  adresse         text,
+  region          text,
+  village         text,
+  profession      text,
+  date_naissance  date,
+  date_adhesion   date default current_date,
+  statut          text not null default 'actif'
+                    check (statut in ('actif','suspendu','sorti')),
+  photo_url       text,
+  created_at      timestamptz default now()
+);
+
+-- Cotisations annuelles
+create table if not exists public.cotisations (
+  id              uuid primary key default uuid_generate_v4(),
+  membre_id       uuid not null references public.membres(id) on delete cascade,
+  annee           integer not null,
+  montant         numeric(12,2) not null default 0,
+  date_paiement   date,
+  statut          text not null default 'paye'
+                    check (statut in ('paye','impaye')),
+  enregistre_par  uuid references public.app_users(id),
+  created_at      timestamptz default now(),
+  unique(membre_id, annee)
+);
+
+-- ══════════════════════════════════════════════
+-- B. PARTS SOCIALES
+-- ══════════════════════════════════════════════
+
+create table if not exists public.parts_sociales (
+  id                uuid primary key default uuid_generate_v4(),
+  membre_id         uuid not null references public.membres(id) on delete cascade,
+  nombre_parts      integer not null default 1,
+  valeur_nominale   numeric(12,2) not null default 5000,
+  montant_libere    numeric(12,2) not null default 0,
+  date_souscription date default current_date,
+  statut            text not null default 'actif'
+                      check (statut in ('actif','transfere','annule')),
+  created_at        timestamptz default now()
+);
+
+create table if not exists public.paiements_parts (
+  id            uuid primary key default uuid_generate_v4(),
+  part_id       uuid not null references public.parts_sociales(id) on delete cascade,
+  montant       numeric(12,2) not null,
+  date_paiement date default current_date,
+  agent_id      uuid references public.app_users(id),
+  created_at    timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- C. ÉPARGNE
+-- ══════════════════════════════════════════════
+
+create table if not exists public.comptes_epargne (
+  id             uuid primary key default uuid_generate_v4(),
+  membre_id      uuid not null references public.membres(id) on delete cascade,
+  numero_compte  text unique,
+  solde          numeric(14,2) not null default 0,
+  taux_interet   numeric(5,2) not null default 5,  -- % annuel
+  date_ouverture date default current_date,
+  statut         text not null default 'actif'
+                   check (statut in ('actif','bloque','cloture')),
+  created_at     timestamptz default now()
+);
+
+create table if not exists public.transactions_epargne (
+  id          uuid primary key default uuid_generate_v4(),
+  compte_id   uuid not null references public.comptes_epargne(id) on delete cascade,
+  type        text not null check (type in ('depot','retrait','interet')),
+  montant     numeric(14,2) not null,
+  date_op     date default current_date,
+  motif       text,
+  agent_id    uuid references public.app_users(id),
+  created_at  timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- D. CRÉDIT & PRÊTS
+-- ══════════════════════════════════════════════
+
+create table if not exists public.demandes_credit (
+  id              uuid primary key default uuid_generate_v4(),
+  membre_id       uuid not null references public.membres(id) on delete cascade,
+  montant_demande numeric(14,2) not null,
+  duree_mois      integer not null default 12,
+  taux            numeric(5,2) not null default 1.5,  -- % mensuel
+  objet           text,
+  statut          text not null default 'en_attente'
+                    check (statut in ('en_attente','actif','rembourse','rejete')),
+  date_demande    date default current_date,
+  valide_par      uuid references public.app_users(id),
+  created_at      timestamptz default now()
+);
+
+create table if not exists public.remboursements (
+  id               uuid primary key default uuid_generate_v4(),
+  credit_id        uuid not null references public.demandes_credit(id) on delete cascade,
+  numero_echeance  integer not null,
+  montant_du       numeric(14,2) not null,
+  montant_paye     numeric(14,2) default 0,
+  date_echeance    date not null,
+  date_paiement    date,
+  statut           text not null default 'en_attente'
+                     check (statut in ('en_attente','paye','retard')),
+  created_at       timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- E. GOUVERNANCE — ASSEMBLÉES
+-- ══════════════════════════════════════════════
+
+create table if not exists public.assemblees (
+  id              uuid primary key default uuid_generate_v4(),
+  type            text not null default 'ordinaire'
+                    check (type in ('ordinaire','extraordinaire')),
+  date_ag         date not null,
+  lieu            text,
+  ordre_du_jour   text,
+  quorum_requis   integer default 0,
+  presents        integer default 0,
+  statut          text not null default 'planifie'
+                    check (statut in ('planifie','tenue','annulee')),
+  pv_url          text,
+  cree_par        uuid references public.app_users(id),
+  created_at      timestamptz default now()
+);
+
+create table if not exists public.presences_ag (
+  id             uuid primary key default uuid_generate_v4(),
+  assemblee_id   uuid not null references public.assemblees(id) on delete cascade,
+  membre_id      uuid not null references public.membres(id) on delete cascade,
+  present        boolean default true,
+  signature_url  text,
+  created_at     timestamptz default now(),
+  unique(assemblee_id, membre_id)
+);
+
+create table if not exists public.resolutions (
+  id             uuid primary key default uuid_generate_v4(),
+  assemblee_id   uuid not null references public.assemblees(id) on delete cascade,
+  intitule       text not null,
+  resultat       text not null default 'adopte'
+                   check (resultat in ('adopte','rejete')),
+  votes_pour     integer default 0,
+  votes_contre   integer default 0,
+  created_at     timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- F. DOCUMENTS
+-- ══════════════════════════════════════════════
+
+create table if not exists public.documents (
+  id                uuid primary key default uuid_generate_v4(),
+  titre             text not null,
+  categorie         text not null,
+  fichier_url       text,
+  version           text default '1.0',
+  acces_role        text default 'tous'
+                      check (acces_role in ('tous','admin','caissier')),
+  date_publication  date default current_date,
+  publie_par        uuid references public.app_users(id),
+  created_at        timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- G. PROJETS & INVESTISSEMENTS
+-- ══════════════════════════════════════════════
+
+create table if not exists public.projets (
+  id              uuid primary key default uuid_generate_v4(),
+  titre           text not null,
+  description     text,
+  budget          numeric(14,2) default 0,
+  statut          text not null default 'en_etude'
+                    check (statut in ('en_etude','approuve','en_cours','termine','suspendu')),
+  date_debut      date,
+  date_fin        date,
+  responsable_id  uuid references public.app_users(id),
+  resolution_id   uuid references public.resolutions(id),
+  created_at      timestamptz default now()
+);
+
+create table if not exists public.depenses_projet (
+  id            uuid primary key default uuid_generate_v4(),
+  projet_id     uuid not null references public.projets(id) on delete cascade,
+  libelle       text not null,
+  montant       numeric(14,2) not null,
+  date_depense  date default current_date,
+  valide_par    uuid references public.app_users(id),
+  created_at    timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- H. DOSSIER DRDR
+-- ══════════════════════════════════════════════
+
+create table if not exists public.dossier_drdr (
+  id             uuid primary key default uuid_generate_v4(),
+  region         text not null,
+  statut         text not null default 'en_preparation'
+                   check (statut in ('en_preparation','depose','en_cours','valide','renouveler')),
+  date_depot     date,
+  date_validite  date,
+  recepisse_url  text,
+  notes          text,
+  created_at     timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- I. COLLECTE & VENTE AGRICOLE
+-- ══════════════════════════════════════════════
+
+create table if not exists public.collectes (
+  id           uuid primary key default uuid_generate_v4(),
+  membre_id    uuid not null references public.membres(id),
+  produit      text not null,
+  quantite_kg  numeric(10,2) not null,
+  qualite      text default 'standard'
+                 check (qualite in ('premium','standard','bas')),
+  prix_unitaire numeric(10,2) not null,
+  montant_total numeric(14,2) generated always as (quantite_kg * prix_unitaire) stored,
+  date_collecte date default current_date,
+  bon_livraison text,
+  statut        text default 'recu'
+                  check (statut in ('recu','vendu','reverse')),
+  agent_id      uuid references public.app_users(id),
+  created_at    timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- J. STOCKS & INTRANTS
+-- ══════════════════════════════════════════════
+
+create table if not exists public.stocks (
+  id           uuid primary key default uuid_generate_v4(),
+  designation  text not null,
+  categorie    text not null
+                 check (categorie in ('semence','engrais','pesticide','materiel','autre')),
+  unite        text default 'kg',
+  quantite     numeric(12,2) not null default 0,
+  prix_unitaire numeric(10,2) default 0,
+  seuil_alerte numeric(12,2) default 0,
+  fournisseur  text,
+  created_at   timestamptz default now()
+);
+
+create table if not exists public.mouvements_stock (
+  id           uuid primary key default uuid_generate_v4(),
+  stock_id     uuid not null references public.stocks(id) on delete cascade,
+  type         text not null check (type in ('entree','sortie','distribution')),
+  quantite     numeric(12,2) not null,
+  membre_id    uuid references public.membres(id),  -- si distribution
+  motif        text,
+  date_mouvement date default current_date,
+  agent_id     uuid references public.app_users(id),
+  created_at   timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- K. RESSOURCES HUMAINES
+-- ══════════════════════════════════════════════
+
+create table if not exists public.employes (
+  id            uuid primary key default uuid_generate_v4(),
+  nom           text not null,
+  prenom        text not null,
+  poste         text not null,
+  salaire       numeric(12,2) default 0,
+  date_embauche date default current_date,
+  statut        text default 'actif'
+                  check (statut in ('actif','conge','fin_contrat')),
+  telephone     text,
+  created_at    timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- L. FORMATION
+-- ══════════════════════════════════════════════
+
+create table if not exists public.formations (
+  id           uuid primary key default uuid_generate_v4(),
+  titre        text not null,
+  description  text,
+  date_debut   date,
+  date_fin     date,
+  lieu         text,
+  formateur    text,
+  statut       text default 'planifie'
+                 check (statut in ('planifie','en_cours','termine','annule')),
+  created_at   timestamptz default now()
+);
+
+create table if not exists public.presences_formation (
+  id            uuid primary key default uuid_generate_v4(),
+  formation_id  uuid not null references public.formations(id) on delete cascade,
+  membre_id     uuid not null references public.membres(id) on delete cascade,
+  present       boolean default true,
+  note          numeric(5,2),
+  certificat    boolean default false,
+  created_at    timestamptz default now(),
+  unique(formation_id, membre_id)
+);
+
+-- ══════════════════════════════════════════════
+-- M. COMPTABILITÉ
+-- ══════════════════════════════════════════════
+
+create table if not exists public.journal_comptable (
+  id          uuid primary key default uuid_generate_v4(),
+  date_op     date not null default current_date,
+  libelle     text not null,
+  debit       numeric(14,2) default 0,
+  credit      numeric(14,2) default 0,
+  compte      text,  -- code compte OHADA
+  reference   text,  -- ex: "CREDIT-xxx", "EPARGNE-xxx"
+  saisie_par  uuid references public.app_users(id),
+  created_at  timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- N. NOTIFICATIONS / MESSAGES
+-- ══════════════════════════════════════════════
+
+create table if not exists public.notifications (
+  id          uuid primary key default uuid_generate_v4(),
+  titre       text not null,
+  message     text not null,
+  type        text default 'info'
+                check (type in ('info','alerte','convocation','rappel')),
+  cible       text default 'tous'
+                check (cible in ('tous','admin','membres')),
+  lu          boolean default false,
+  created_by  uuid references public.app_users(id),
+  created_at  timestamptz default now()
+);
+
+-- ══════════════════════════════════════════════
+-- O. INDEX POUR LES PERFORMANCES
+-- ══════════════════════════════════════════════
+
+create index if not exists idx_membres_statut      on public.membres(statut);
+create index if not exists idx_membres_region      on public.membres(region);
+create index if not exists idx_cotisations_membre  on public.cotisations(membre_id);
+create index if not exists idx_cotisations_annee   on public.cotisations(annee);
+create index if not exists idx_epargne_membre      on public.comptes_epargne(membre_id);
+create index if not exists idx_tx_compte           on public.transactions_epargne(compte_id);
+create index if not exists idx_tx_date             on public.transactions_epargne(date_op);
+create index if not exists idx_credit_membre       on public.demandes_credit(membre_id);
+create index if not exists idx_credit_statut       on public.demandes_credit(statut);
+create index if not exists idx_remb_credit         on public.remboursements(credit_id);
+create index if not exists idx_remb_statut         on public.remboursements(statut);
+create index if not exists idx_ag_date             on public.assemblees(date_ag);
+create index if not exists idx_collecte_membre     on public.collectes(membre_id);
+create index if not exists idx_mouvement_stock     on public.mouvements_stock(stock_id);
+
+-- ══════════════════════════════════════════════
+-- P. ROW LEVEL SECURITY (RLS)
+-- ══════════════════════════════════════════════
+
+-- Activer RLS sur toutes les tables sensibles
+alter table public.app_users           enable row level security;
+alter table public.membres             enable row level security;
+alter table public.cotisations         enable row level security;
+alter table public.parts_sociales      enable row level security;
+alter table public.paiements_parts     enable row level security;
+alter table public.comptes_epargne     enable row level security;
+alter table public.transactions_epargne enable row level security;
+alter table public.demandes_credit     enable row level security;
+alter table public.remboursements      enable row level security;
+alter table public.assemblees          enable row level security;
+alter table public.presences_ag        enable row level security;
+alter table public.resolutions         enable row level security;
+alter table public.documents           enable row level security;
+alter table public.projets             enable row level security;
+alter table public.depenses_projet     enable row level security;
+alter table public.dossier_drdr        enable row level security;
+alter table public.collectes           enable row level security;
+alter table public.stocks              enable row level security;
+alter table public.mouvements_stock    enable row level security;
+alter table public.employes            enable row level security;
+alter table public.formations          enable row level security;
+alter table public.presences_formation enable row level security;
+alter table public.journal_comptable   enable row level security;
+alter table public.notifications       enable row level security;
+
+-- ── Fonction utilitaire : récupérer le rôle de l'utilisateur connecté
+create or replace function public.get_my_role()
+returns text language sql stable security definer as $$
+  select role from public.app_users where id = auth.uid();
+$$;
+
+-- ── Politique : les admins voient et modifient tout
+-- ── Les membres voient uniquement leurs propres données
+
+-- app_users
+create policy "Lecture profil" on public.app_users
+  for select using (id = auth.uid() or public.get_my_role() in ('admin','secretaire'));
+create policy "Mise à jour profil" on public.app_users
+  for update using (id = auth.uid() or public.get_my_role() = 'admin');
+create policy "Insertion admin" on public.app_users
+  for insert with check (public.get_my_role() = 'admin');
+
+-- membres (lecture : tout utilisateur connecté / écriture : admin + secrétaire)
+create policy "Lecture membres" on public.membres
+  for select using (auth.uid() is not null);
+create policy "Ecriture membres" on public.membres
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- cotisations
+create policy "Lecture cotisations" on public.cotisations
+  for select using (auth.uid() is not null);
+create policy "Ecriture cotisations" on public.cotisations
+  for all using (public.get_my_role() in ('admin','caissier','secretaire'));
+
+-- parts sociales
+create policy "Lecture parts" on public.parts_sociales
+  for select using (auth.uid() is not null);
+create policy "Ecriture parts" on public.parts_sociales
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- paiements parts
+create policy "Lecture paiements_parts" on public.paiements_parts
+  for select using (auth.uid() is not null);
+create policy "Ecriture paiements_parts" on public.paiements_parts
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- comptes épargne
+create policy "Lecture epargne" on public.comptes_epargne
+  for select using (
+    public.get_my_role() in ('admin','caissier','secretaire')
+    or membre_id in (select id from public.membres where user_id = auth.uid())
+  );
+create policy "Ecriture epargne" on public.comptes_epargne
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- transactions épargne
+create policy "Lecture transactions" on public.transactions_epargne
+  for select using (
+    public.get_my_role() in ('admin','caissier')
+    or compte_id in (
+      select ce.id from public.comptes_epargne ce
+      join public.membres m on m.id = ce.membre_id
+      where m.user_id = auth.uid()
+    )
+  );
+create policy "Ecriture transactions" on public.transactions_epargne
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- crédits
+create policy "Lecture credits" on public.demandes_credit
+  for select using (
+    public.get_my_role() in ('admin','caissier','secretaire')
+    or membre_id in (select id from public.membres where user_id = auth.uid())
+  );
+create policy "Ecriture credits" on public.demandes_credit
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- remboursements
+create policy "Lecture remb" on public.remboursements
+  for select using (auth.uid() is not null);
+create policy "Ecriture remb" on public.remboursements
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- assemblées (lecture publique, écriture admin)
+create policy "Lecture ag" on public.assemblees
+  for select using (auth.uid() is not null);
+create policy "Ecriture ag" on public.assemblees
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- presences_ag
+create policy "Lecture presences" on public.presences_ag
+  for select using (auth.uid() is not null);
+create policy "Ecriture presences" on public.presences_ag
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- resolutions
+create policy "Lecture resolutions" on public.resolutions
+  for select using (auth.uid() is not null);
+create policy "Ecriture resolutions" on public.resolutions
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- documents
+create policy "Lecture documents" on public.documents
+  for select using (
+    acces_role = 'tous' or public.get_my_role() in ('admin','secretaire')
+  );
+create policy "Ecriture documents" on public.documents
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- projets
+create policy "Lecture projets" on public.projets
+  for select using (auth.uid() is not null);
+create policy "Ecriture projets" on public.projets
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- dépenses projet
+create policy "Lecture depenses" on public.depenses_projet
+  for select using (auth.uid() is not null);
+create policy "Ecriture depenses" on public.depenses_projet
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- dossier drdr
+create policy "Lecture drdr" on public.dossier_drdr
+  for select using (auth.uid() is not null);
+create policy "Ecriture drdr" on public.dossier_drdr
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- collectes
+create policy "Lecture collectes" on public.collectes
+  for select using (auth.uid() is not null);
+create policy "Ecriture collectes" on public.collectes
+  for all using (public.get_my_role() in ('admin','conseiller'));
+
+-- stocks
+create policy "Lecture stocks" on public.stocks
+  for select using (auth.uid() is not null);
+create policy "Ecriture stocks" on public.stocks
+  for all using (public.get_my_role() in ('admin','conseiller'));
+
+-- mouvements stock
+create policy "Lecture mvt stock" on public.mouvements_stock
+  for select using (auth.uid() is not null);
+create policy "Ecriture mvt stock" on public.mouvements_stock
+  for all using (public.get_my_role() in ('admin','conseiller'));
+
+-- employes
+create policy "Lecture employes" on public.employes
+  for select using (public.get_my_role() in ('admin','secretaire'));
+create policy "Ecriture employes" on public.employes
+  for all using (public.get_my_role() = 'admin');
+
+-- formations
+create policy "Lecture formations" on public.formations
+  for select using (auth.uid() is not null);
+create policy "Ecriture formations" on public.formations
+  for all using (public.get_my_role() in ('admin','conseiller'));
+
+-- presences formation
+create policy "Lecture pres formation" on public.presences_formation
+  for select using (auth.uid() is not null);
+create policy "Ecriture pres formation" on public.presences_formation
+  for all using (public.get_my_role() in ('admin','conseiller'));
+
+-- journal comptable
+create policy "Lecture journal" on public.journal_comptable
+  for select using (public.get_my_role() in ('admin','caissier'));
+create policy "Ecriture journal" on public.journal_comptable
+  for all using (public.get_my_role() in ('admin','caissier'));
+
+-- notifications
+create policy "Lecture notifs" on public.notifications
+  for select using (auth.uid() is not null);
+create policy "Ecriture notifs" on public.notifications
+  for all using (public.get_my_role() in ('admin','secretaire'));
+
+-- ══════════════════════════════════════════════
+-- Q. TRIGGER : créer automatiquement app_users à l'inscription
+-- ══════════════════════════════════════════════
+
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer as $$
+begin
+  insert into public.app_users (id, email, nom, prenom, role, statut)
+  values (
+    new.id,
+    new.email,
+    coalesce(new.raw_user_meta_data->>'nom', ''),
+    coalesce(new.raw_user_meta_data->>'prenom', ''),
+    coalesce(new.raw_user_meta_data->>'role', 'membre'),
+    'actif'
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
+
+-- ══════════════════════════════════════════════
+-- R. DONNÉES DE TEST (optionnel — à supprimer en production)
+-- ══════════════════════════════════════════════
+
+-- Pour tester sans auth, créer d'abord un utilisateur via Supabase Auth,
+-- puis insérer son UUID ci-dessous à la place de 'VOTRE-UUID'.
+
+-- insert into public.membres (nom, prenom, numero_membre, region, village, date_adhesion, statut)
+-- values ('Diallo', 'Mamadou', 'MBR-24-0001', 'Thiès', 'Mbour', current_date, 'actif');
+
+-- ══════════════════════════════════════════════
+-- FIN DU SCRIPT
+-- Exécuter dans : Supabase > SQL Editor > Run
+-- ══════════════════════════════════════════════
